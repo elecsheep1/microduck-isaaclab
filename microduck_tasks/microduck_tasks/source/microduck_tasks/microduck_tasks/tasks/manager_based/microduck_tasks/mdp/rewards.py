@@ -2,8 +2,9 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
-
 from __future__ import annotations
+
+import math
 
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -285,7 +286,7 @@ def phase_foot_contact(
     return reward * (command_speed > command_threshold)
 
 class HalfCycleActiveJointSymmetry(ManagerTermBase):
-    """奖励左右腿相隔半个步态周期后的镜像关节运动。
+    """奖励左右腿在相位相隔半周期时的镜像关节运动。
 
     对 Microduck 而言，左右关节默认姿态互为相反数，例如：
 
@@ -294,10 +295,12 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
 
     因此不能直接比较左右绝对关节角，而应比较“相对默认姿态的偏移”。
 
+    对每个环境，从历史中寻找与当前相位相差约 0.5 周期的状态。
+    周期随速度改变时，这个历史状态不一定恰好在固定的若干步之前。
     理想镜像关系为：
 
-        left_offset(t)  ~= -right_offset(t - T/2)
-        right_offset(t) ~= -left_offset(t - T/2)
+        left_offset(当前)  ~= -right_offset(半周期前)
+        right_offset(当前) ~= -left_offset(半周期前)
 
     偏航命令较大时，奖励会平滑减弱，为差速转弯留出空间。
 
@@ -313,6 +316,8 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
     v2 额外要求：
         hip pitch 和 knee 必须具有足够的关节偏移，
         才能获得镜像奖励。
+
+    当前实现还比较 hip roll，并用历史相位而非固定步数查找半周期前的状态。
     """
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         """创建奖励对象，并分配每个环境独立的历史缓存。"""
@@ -321,42 +326,39 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
         # 父类会保存 cfg 和 env，供 Manager 生命周期管理。
         super().__init__(cfg, env)
         
-        # 计算半周期包含多少个控制步。
-        #
-        # env.step_dt 是一个控制步的时间，例如 0.02 秒。
-        # 0.5 * 0.60 / 0.02 = 15 步。
-        #
-        # round() 避免浮点数误差把 15 算成 14 或 16。
-        # max(1, ...) 防止错误配置导致历史长度为 0
-        period_s = float(cfg.params["period_s"])
-        self._half_cycle_steps = max(
-            1,
-            round(0.5 * period_s / env.step_dt),
+        # 计算最长步态周期的一半对应多少个控制步，并额外留出 2 步余量。
+        # 取最长周期，是为了即使步态处于最慢状态，缓存也覆盖得了半个周期。
+        # 为了取缓存长度
+        max_period_s = max(
+            float(cfg.params["period_s"]),
+            float(cfg.params["slow_period_s"]),
         )
+        self._history_len = math.ceil(0.5 * max_period_s / env.step_dt) + 2
 
-        # 创建环形历史缓存。
+        # 创建关节偏移和对应相位的环形历史缓存。
         #
         # shape:
-        #   [env.num_envs, self._half_cycle_steps, 8]
+        #   _history:       [环境数量, 历史槽位数, 8 个关节]
+        #   _phase_history: [环境数量, 历史槽位数]
         #
-        # 第 1 维：并行环境编号。
-        # 第 2 维：过去半周期内的历史控制步。
-        # 第 3 维：八个待比较的关节，顺序与配置中的 joint_names 一致：
+        # 8 个关节的顺序与配置中的 joint_names 一致：
         # left_hip_roll, left_hip_pitch, left_knee, left_ankle,
         # right_hip_roll, right_hip_pitch, right_knee, right_ankle
         #
-        # 每个环境都必须各自保存历史。
-        # 不能把所有环境共用一个历史，因为它们会在不同时间 reset。
+        # 每个环境独立保存自己的历史，因为并行环境可能在不同时间 reset。
         self._history = torch.zeros(
             env.num_envs,
-            self._half_cycle_steps,
+            self._history_len,
             8,
             device=env.device,
         )
-        # 记录每个环境已经积累了多少历史步。
-        #
-        # episode 刚 reset 后，尚未积满 15 步，
-        # 此时不能拿全零历史去做镜像比较。
+        self._phase_history = torch.zeros(
+            env.num_envs,
+            self._history_len,
+            device=env.device,
+        )
+        # 记录每个环境已写入的有效槽位数；reset 后旧槽位不能参与匹配。
+        # 是否真正覆盖半周期，要在 __call__ 中根据历史相位差判断。
         self._valid_steps = torch.zeros(
             env.num_envs,
             dtype=torch.long,
@@ -372,9 +374,11 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
         # 环境重置后清掉旧历史，避免新一轮动作和上一轮动作进行比较。
         if env_ids is None:
             self._history.zero_()
+            self._phase_history.zero_()
             self._valid_steps.zero_()
         else:
             self._history[env_ids] = 0.0
+            self._phase_history[env_ids] = 0.0
             self._valid_steps[env_ids] = 0
 
     def __call__(
@@ -382,14 +386,17 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
             env: ManagerBasedRLEnv,
             command_name: str,
             period_s: float,
+            slow_period_s: float,
+            slow_speed: float,
+            fast_speed: float,
             command_threshold: float,
             yaw_scale: float,
             std: float,
             roll_std: float,    # hip_roll 镜像误差的容忍尺度，单位 rad；越小越严格
-            roll_fraction: float,   # roll 在原有镜像匹配度中的影响比例；0 表示不考虑
+            roll_fraction: float,   # roll 对镜像匹配度的影响比例；0 表示不考虑
             min_motion: float, # hip/knee 的最小有效关节偏移，单位 rad。小于此幅度时，主动摆动门控将降低，防止策略靠“不动”获得高镜像分。
             joint_weights: tuple[float, float, float],  # 三个关节的镜像误差权重。顺序：[hip_pitch, knee, ankle]
-            motion_joint_weights: tuple[float, float, float],  # # 三个关节的“主动摆动”门控权重。
+            motion_joint_weights: tuple[float, float, float],  # 三个关节的“主动摆动”门控权重。
             asset_cfg: SceneEntityCfg,
     ) -> torch.Tensor:
         """计算每个并行环境的半周期镜像奖励。
@@ -409,9 +416,48 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
             - asset.data.default_joint_pos.torch[:, asset_cfg.joint_ids]
         )
 
-        # 取出当前历史里保存的旧动作。因为每次调用都会循环移动编号，
-        # 正常填满缓冲区后，这里取到的就是半个周期前的关节偏移。
-        delayed_offset = self._history[:, self._write_index]
+        # 与策略观测、接触奖励共用同一自适应相位。
+        # 相位由每个环境的速度命令决定；同一控制步重复调用不会重复推进。
+        phase = adaptive_gait_phase(
+            env,
+            command_name=command_name,
+            period_s=period_s,
+            slow_period_s=slow_period_s,
+            slow_speed=slow_speed,
+            fast_speed=fast_speed,
+            command_threshold=command_threshold,
+        )
+
+        # 枚举历史槽位，而不是环境编号；下方会为每个环境单独选槽位。
+        # 这会创建全部槽位编号，例如历史长度为 25：
+        # slot_ids = [0, 1, 2, ..., 24]
+        slot_ids = torch.arange(self._history_len, device=env.device)
+
+        # 按环形写入指针计算各槽位距今的步数；reset 后尚未写入的槽位无效。
+        # `age` 表示：每个槽位里的数据距离当前有多少个控制步
+        age = (self._write_index - 1 - slot_ids) % self._history_len + 1
+        valid = age.unsqueeze(0) <= self._valid_steps.unsqueeze(1)
+
+        # 在 [0, 1) 的环形相位上计算历史状态到当前状态的相位进度。
+        # 当前 0.60–0.90 s 的周期配置下，最长历史窗口小于一个最快周期，
+        # 因此不会把更早的整周期误认成半周期；改动周期范围时需重新核对这一条件。
+        phase_advance = torch.remainder(
+            phase[:, None] - self._phase_history,
+            1.0,
+        )
+        # 与半周期 0.5 的距离；无效槽位不能参与最小误差选择。
+        phase_error = torch.abs(phase_advance - 0.5)
+        phase_error = phase_error.masked_fill(~valid,float("inf"))
+
+        # 每个环境单独选择最接近“半周期前”的历史槽位，不做时间插值。
+        # 没有有效历史时虽会得到默认索引，但下方 history_ready 会使奖励为零。
+        best_slot = phase_error.argmin(dim=1)
+        env_ids = torch.arange(env.num_envs, device=env.device)
+        delayed_offset = self._history[env_ids, best_slot]
+
+        # 只有有效历史的相位跨度达到半周期，才允许发放镜像奖励。
+        covered_phase = phase_advance.masked_fill(~valid, -1.0).max(dim=1).values
+        history_ready = covered_phase >= 0.5 - 1e-4
 
         # 将 Python tuple 转成 GPU tensor。
         symmetry_weights = torch.tensor(
@@ -502,9 +548,8 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
             + torch.abs(delayed_offset[:, 1:4])
         )
 
-        # 只使用 hip pitch 和 knee 的摆动幅度。
-        #
-        # ankle 权重为 0，不让它影响“是否在主动走路”的判断。
+        # 按配置中的 motion_joint_weights 计算主动摆动幅度。
+        # 当前配置把 ankle 权重设为 0，只用 hip pitch 和 knee 判断是否在走路。
         left_motion = (
             left_pair_motion * motion_weights
         ).sum(dim=1) / motion_weights.sum()
@@ -538,12 +583,6 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
             + right_match * right_motion_gate
         )
 
-        # 判断每个环境是否已积累完整半周期历史。
-        #
-        # reset 后前 15 步不计算镜像奖励，
-        # 否则会把当前姿态和无意义的全零缓存相比较。
-        history_ready = self._valid_steps >= self._half_cycle_steps
-
         # 取出运动命令，并计算前后、左右方向合成的移动速度。
         command = env.command_manager.get_command(command_name)
         command_speed = torch.linalg.norm(command[:, :2], dim=1)
@@ -552,23 +591,23 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
         # yaw__scale 控制它变小的速度。
         yaw_gate = torch.exp(-torch.square(command[:, 2] / yaw_scale))
 
-        # 将当前帧写入刚刚读取的槽位，供半周期后的调用读取。
-        # 更新指针使其循环遍历缓冲区；计数封顶后表示历史已完整可用。
-        # 达到末尾时 % 会让它回到 0。
+        # 把当前关节偏移及其相位写入同一个槽位，供未来按相位查找。
+        # 写入指针循环移动；有效槽位计数在缓存长度处封顶。
         self._history[:, self._write_index] = joint_offset
+        self._phase_history[:, self._write_index] = phase
         self._write_index = (
             self._write_index + 1
-        ) % self._half_cycle_steps
-        # 历史步数最多记到半周期长度；再增加也不影响“历史是否已准备好”。
+        ) % self._history_len
+        # 槽位数达到上限不代表已覆盖半周期；仍由 history_ready 按相位判断。
         self._valid_steps = torch.clamp(
             self._valid_steps + 1,
-            max= self._half_cycle_steps,
+            max= self._history_len,
         )
 
         # 四个条件组合：
         #
         # 1. reward：镜像程度；
-        # 2. history_ready：必须积满半周期历史；
+        # 2. history_ready：有效历史的相位跨度必须达到半周期；
         # 3. command_speed > threshold：只有走路命令时才约束；
         # 4. yaw_gate：转弯时自动弱化。
         #
