@@ -218,3 +218,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local upstream checkout: use it as a reference, do not commit it here.
+/upstream_microduck_rl/
+
+# Recoverable copy of the former nested Git metadata during repository consolidation.
+/.git-backups/
+
+# Simulation and RL output. Source MJCF, meshes and USD assets remain trackable.
+/microduck_tasks/microduck_tasks/logs/
+/microduck_tasks/microduck_tasks/outputs/
+/microduck_tasks/microduck_tasks/recordings/
+/microduck_tasks/microduck_tasks/videos/
+/microduck_tasks/microduck_tasks/wandb/
+/microduck_usd/.asset_hash
+
+# Local editor state.
+.idea/
+.vscode/
+*.swp
+*.swo
