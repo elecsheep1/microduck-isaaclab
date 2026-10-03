@@ -229,6 +229,16 @@ def phase_foot_contact(
         slow_speed:float,
         fast_speed:float,
         command_threshold: float, 
+        slow_stance_fraction: float,
+        # 低速时单脚的支撑占空比。
+        # 例如 0.62 表示每只脚在一个完整周期中约 62% 时间处于支撑。
+        # 双足相差半周期时，双支撑比例约为 2 * 0.62 - 1 = 24%。
+        fast_stance_fraction: float,
+        # 高速时的支撑占空比。
+        # 例如 0.52，意味着双支撑约为 4%，更接近快速交替迈步。
+        transition_fraction: float,
+        # 接触目标在离地、落地边界附近的平滑宽度，以“周期比例”为单位。
+        # 例如 0.04 表示每个切换边界约有 4% 周期的软过渡区
         force_threshold: float, 
         sensor_cfg: SceneEntityCfg,
     ) -> torch.Tensor:
@@ -246,7 +256,8 @@ def phase_foot_contact(
     # 计算各脚的接触力大小：
     # net_forces_w_history 的最后一维是三维力向量 [Fx, Fy, Fz]
     # 对该维做范数，相当于计算 |F| = sqrt(Fx^2 + Fy^2 + Fz^2)
-    # 再沿历史时间维度取最大值，得到该脚在当前时刻的代表性接触力
+    # 再沿历史时间维度取最大值，得到该脚在当前时刻的代表性接触力（[0]即max(dim=1)的0维）
+    # contacts = [[True, False], ...]
     contacts = (
         contact_sensor.data.net_forces_w_history.torch[
             :, :, sensor_cfg.body_ids, :
@@ -266,22 +277,65 @@ def phase_foot_contact(
         fast_speed=fast_speed,
         command_threshold=command_threshold,
     )
-
-    # 前半个周期：左脚应支撑、右脚应摆动
-    left_should_stand = phase < 0.5
-    # 期望接触状态：左脚/右脚
-    desired_contacts = torch.stack((left_should_stand, ~left_should_stand),dim=1,)
-    # 计算真实接触状态与期望状态的匹配程度
-    # 若完全一致则为 1.0；若完全相反则为 0.0；若一对一错则为 0.5
-    contact_match = (contacts == desired_contacts).float().mean(dim=1)
-    # 将 [0,1] 映射到 [-0.5, 0.5]
-    # 全匹配 -> +0.5
-    # 全相反 -> -0.5
-    # 一半匹配 -> 0
-    reward =contact_match - 0.5
-
-    # 只在命令速度大于阈值时给奖励，避免静止时通过奇怪接触模式作弊
+    # 取当前平面速度
     command_speed = torch.linalg.norm(env.command_manager.get_command(command_name)[:, :2],dim=1)
+    # 把速度映射成速度比例
+    # 低于 slow_speed 时为 0，对应慢速支撑占空比；
+    # 高于 fast_speed 时为 1，对应快速支撑占空比
+    speed_ratio = (
+        (command_speed - slow_speed) / (fast_speed - slow_speed)
+    ).clamp(0.0, 1.0)
+
+    # 根据速度插值支撑比例
+    # 低速时支撑更久、允许更多双支撑；
+    # 高速时逐渐缩短支撑，恢复接近交替单脚支撑。
+    stance_fraction = (
+        slow_stance_fraction
+        + (fast_stance_fraction - slow_stance_fraction) * speed_ratio
+    )
+
+    # 左右腿相位固定相差半周期。
+    #
+    # phase = 0 时左腿刚进入支撑段；
+    # 右腿比左腿晚半个周期，故加 0.5 后取模。
+    # torch.stack((左, 右), dim=1) —— 拼成两腿的相位张量
+    leg_phase = torch.stack((phase, torch.remainder(phase + 0.5, 1.0)), dim=1)
+
+    # 将每条腿的支撑区间设为 [0, stance_fraction)。
+    #
+    # 为了正确处理 phase=0 的周期边界，先把相位转换为
+    # 相对于支撑段中心的环形距离，而不是直接比较 phase 是否小于阈值
+    stance_center = 0.5 * stance_fraction.unsqueeze(1)
+    # 求环上最短距离
+    # 设 x = leg_phase - stance_center，这个组合是求环上最短距离的标准技巧。三步：
+    # 第 1 步 x + 0.5：把距离范围偏移
+    # 第 2 步 remainder(..., 1.0)：绕回 [0, 1)
+    # 第 3 步 - 0.5 再 abs：把结果映射回 [0, 0.5]
+    # 最终得到的就是"在 0~1 的环上，两点间最短距离"，范围恒为 [0, 0.5]（因为环上两点最远也就差半圈）。
+    phase_distance = torch.abs(
+        torch.remainder(leg_phase - stance_center + 0.5, 1.0) - 0.5
+    )
+
+    # 产生 [0, 1] 的连续期望接触概率：
+    #
+    # - 支撑区间中央：接近 1，明确要求接触；
+    # - 摆动区间中央：接近 0，明确要求离地；
+    # - 起落脚边界：接近 0.5，允许自然的双支撑或短暂接触切换。
+    desired_contact_prob = torch.sigmoid(
+        (0.5 * stance_fraction.unsqueeze(1) - phase_distance) / transition_fraction
+    )
+
+    # 实际接触为 0/1，期望接触为连续概率。
+    #
+    # 完全符合期望时得 1；
+    # 完全相反时得 0；
+    # 在平滑边界处，双支撑或离地不会因硬阈值而突然受到大惩罚。
+    contact_match = (
+        1.0 - torch.abs(contacts.float() - desired_contact_prob)
+    ).mean(dim=1)
+
+    # 保持原奖励范围 [-0.5, +0.5]，避免突然改变总奖励量级。
+    reward = contact_match - 0.5
 
     return reward * (command_speed > command_threshold)
 
@@ -439,7 +493,6 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
         valid = age.unsqueeze(0) <= self._valid_steps.unsqueeze(1)
 
         # 在 [0, 1) 的环形相位上计算历史状态到当前状态的相位进度。
-        # 当前 0.60–0.90 s 的周期配置下，最长历史窗口小于一个最快周期，
         # 因此不会把更早的整周期误认成半周期；改动周期范围时需重新核对这一条件。
         phase_advance = torch.remainder(
             phase[:, None] - self._phase_history,

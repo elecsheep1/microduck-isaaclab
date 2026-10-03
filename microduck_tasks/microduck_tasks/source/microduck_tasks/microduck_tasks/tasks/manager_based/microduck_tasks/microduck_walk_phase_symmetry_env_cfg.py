@@ -110,7 +110,7 @@ class ObservationsCfg:
             params={
                 "command_name": "base_velocity",
                 "period_s": 0.60,
-                "slow_period_s": 0.90,
+                "slow_period_s": 0.72,
                 "slow_speed": 0.04,
                 "fast_speed": 0.12,
                 "command_threshold": 0.02,
@@ -244,10 +244,13 @@ class RewardsCfg:
         params={
             "command_name": "base_velocity",
             "period_s": 0.60,
-            "slow_period_s": 0.90,
+            "slow_period_s": 0.72,
             "slow_speed": 0.04,
             "fast_speed": 0.12,
             "command_threshold": 0.02,
+            "slow_stance_fraction": 0.62,
+            "fast_stance_fraction": 0.52,
+            "transition_fraction": 0.04,
             "force_threshold": 1.0,
             "sensor_cfg": SceneEntityCfg(
                 "feet_contact",
@@ -262,11 +265,11 @@ class RewardsCfg:
     # v2：只有髋、膝确实在主动摆动时才奖励左右腿半周期后的镜像关系
     half_cycle_active_joint_symmetry = RewTerm(
         func=mdp.HalfCycleActiveJointSymmetry,
-        weight=0.10,
+        weight=0.03,
         params={
             "command_name": "base_velocity",
             "period_s": 0.60,
-            "slow_period_s": 0.90,
+            "slow_period_s": 0.72,
             "slow_speed": 0.04,
             "fast_speed": 0.12,
             "command_threshold": 0.02,# 命令平面速度低于该值时不给对称奖励。防止静止时机器人为了镜像而无意义摆腿。
