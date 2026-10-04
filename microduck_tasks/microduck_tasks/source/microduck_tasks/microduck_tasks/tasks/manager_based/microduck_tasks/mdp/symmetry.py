@@ -11,6 +11,11 @@ from tensordict import TensorDict
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+from ..microduck_walk_params import (
+    STANDING_LINEAR_SPEED_THRESHOLD,
+    STANDING_YAW_RATE_THRESHOLD,
+)
+
 
 @torch.no_grad()
 def compute_symmetry_states(
@@ -118,8 +123,8 @@ def _mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
     # 观测内 [3:6] 是 [vx, vy, yaw_rate]，与环境里的 standing 判定保持一致。
     command_speed = torch.linalg.norm(obs[:, 3:5], dim=1)
     standing = (
-        (command_speed <= 0.02)
-        & (torch.abs(obs[:, 5]) <= 0.05)
+        (command_speed <= STANDING_LINEAR_SPEED_THRESHOLD)
+        & (torch.abs(obs[:, 5]) <= STANDING_YAW_RATE_THRESHOLD)
     )
     mirrored_phase = torch.where(
         standing.unsqueeze(1),

@@ -18,6 +18,11 @@ if TYPE_CHECKING:
     from isaaclab.assets import Articulation
     from isaaclab.envs import ManagerBasedRLEnv
 
+from ..microduck_walk_params import (
+    STANDING_LINEAR_SPEED_THRESHOLD,
+    STANDING_YAW_RATE_THRESHOLD,
+)
+
 
 def joint_pos_target_l2(env: ManagerBasedRLEnv, target: float, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """惩罚关节位置偏离目标值。
@@ -147,7 +152,7 @@ def adaptive_gait_phase(
         slow_period_s: float,
         slow_speed: float,
         fast_speed: float,
-        command_threshold: float = 0.02,
+        command_threshold: float = STANDING_LINEAR_SPEED_THRESHOLD,
 ) -> torch.Tensor:
     """根据移动速度调整步态周期，并为每个并行环境维护自己的相位。
 
@@ -215,7 +220,7 @@ def adaptive_gait_phase(
     # 只有线速度和转向速度都足够小时，才认定为“站立”。
     standing = (
         (speed <= command_threshold)
-        & (torch.abs(command[:, 2]) <= 0.05)
+        & (torch.abs(command[:, 2]) <= STANDING_YAW_RATE_THRESHOLD)
     )
 
     # reset 和站立都使用固定相位 0。

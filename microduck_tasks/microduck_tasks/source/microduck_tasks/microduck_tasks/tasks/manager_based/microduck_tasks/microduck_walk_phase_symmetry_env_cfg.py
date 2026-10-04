@@ -14,6 +14,17 @@ from isaaclab.utils.configclass import configclass
 from isaaclab.sensors import ContactSensorCfg
 
 from microduck_tasks.assets.microduck_cfg import MICRODUCK_CFG
+from .microduck_walk_params import (
+    COMMAND_NAME,
+    STANDING_YAW_RATE_THRESHOLD,
+    STANDING_LINEAR_SPEED_THRESHOLD,
+    WALKING_GATE_PARAMS,
+    GAIT_PHASE_PARAMS,
+    GAIT_CONTACT_SCHEDULE_PARAMS,
+    STANDING_GATE_PARAMS,
+    TURNING_SOFT_GATE_PARAMS,
+    FOOT_CONTACT_FORCE_PARAMS,
+)
 
 from . import mdp
 
@@ -92,30 +103,6 @@ class CommandsCfg:
         ),
     )
 
-# 参数字典
-GAIT_PHASE_PARAMS = {
-    "command_name": "base_velocity",
-    # 中高速时的完整步态周期：左、右各完成一次摆动为一个周期。
-    "period_s": 0.60,
-
-    # 慢速时采用的完整步态周期。
-    "slow_period_s": 0.60,
-
-    # 线速度低于 slow_speed 时使用慢速周期；
-    # 高于 fast_speed 时使用 period_s；中间连续插值。
-    "slow_speed": 0.04,
-    "fast_speed": 0.12,
-
-    # 速度低于该值时视为站立，不推进自适应步态相位。
-    "command_threshold": 0.02,
-}
-
-GAIT_CONTACT_SCHEDULE_PARAMS = {
-    "slow_stance_fraction": 0.62,
-    "fast_stance_fraction": 0.52,
-    "transition_fraction": 0.04,
-}
-
 @configclass
 class ObservationsCfg:
     """策略观测空间配置"""
@@ -126,7 +113,7 @@ class ObservationsCfg:
         # base_lin_vel = ObsTerm(func=mdp.base_lin_vel)  # 实机不一定能获取到噪声低且准确的速度反馈
         velocity_command = ObsTerm(
             func=mdp.generated_commands,
-            params={"command_name": "base_velocity"},
+            params={"command_name": COMMAND_NAME},
         )
         gait_phase = ObsTerm(
             func=mdp.gait_phase_sin_cos,
@@ -196,9 +183,7 @@ class RewardsCfg:
         func=mdp.stand_vertical_velocity_exp,
         weight=0.25,
         params={
-            "command_name": "base_velocity",
-            "command_threshold": 0.02,
-            "yaw_threshold": 0.05,
+            **STANDING_GATE_PARAMS,
             "std": 0.03,
         },
     )
@@ -214,7 +199,7 @@ class RewardsCfg:
         func=mdp.track_lin_vel_xy_exp,
         weight=3.0,
         params={
-            "command_name": "base_velocity",
+            "command_name": COMMAND_NAME,
             "std": 0.10,
         },
     )
@@ -224,7 +209,7 @@ class RewardsCfg:
         func=mdp.track_ang_vel_z_exp,
         weight=1.0,
         params={
-            "command_name": "base_velocity",
+            "command_name": COMMAND_NAME,
             "std": 0.25,
         },
     )
@@ -234,9 +219,8 @@ class RewardsCfg:
         func=mdp.biped_air_time,
         weight=2.0,
         params={
-            "command_name": "base_velocity",
+            **WALKING_GATE_PARAMS,
             "threshold": 0.15,
-            "command_threshold": 0.02,
             "sensor_cfg": SceneEntityCfg(
                 "feet_contact",
                 body_names=[
@@ -276,7 +260,7 @@ class RewardsCfg:
         params={
             **GAIT_PHASE_PARAMS,
             **GAIT_CONTACT_SCHEDULE_PARAMS,
-            "force_threshold": 1.0,
+            **FOOT_CONTACT_FORCE_PARAMS,
             "sensor_cfg": SceneEntityCfg(
                 "feet_contact",
                 body_names=["ankle_left", "ankle_right"],
@@ -292,8 +276,8 @@ class RewardsCfg:
         params={
             **GAIT_PHASE_PARAMS,
             **GAIT_CONTACT_SCHEDULE_PARAMS,
-            "yaw_scale": 0.30,
-            "force_threshold": 1.0,
+            **TURNING_SOFT_GATE_PARAMS,
+            **FOOT_CONTACT_FORCE_PARAMS,
             "sensor_cfg": SceneEntityCfg(
                 "feet_contact",
                 body_names=["ankle_left", "ankle_right"],
@@ -329,9 +313,9 @@ class RewardsCfg:
         weight=-0.00,
         params={
             **GAIT_PHASE_PARAMS,
-            "yaw_threshold": 0.05,
+            "yaw_threshold": STANDING_YAW_RATE_THRESHOLD,
+            **FOOT_CONTACT_FORCE_PARAMS,
             "min_cycle_time_s": 0.45,
-            "force_threshold": 1.0,
             "sensor_cfg": SceneEntityCfg(
                 "feet_contact",
                 body_names=["ankle_left", "ankle_right"],
@@ -346,7 +330,7 @@ class RewardsCfg:
         weight=0.00,
         params={
             **GAIT_PHASE_PARAMS,
-            "yaw_scale": 0.30,
+            **TURNING_SOFT_GATE_PARAMS,
             "std": 0.25,
             "roll_std": 0.25,
             "roll_fraction": 0.20,
@@ -379,11 +363,10 @@ class RewardsCfg:
         func=mdp.hip_yaw_target_neutral_deadband,
         weight=-0.03,
         params={
-            "command_name": "base_velocity",
-            "command_threshold": 0.02,
+            **WALKING_GATE_PARAMS,
             # 当目标 yaw 速度达到 0.30 rad/s 时，
             # 该项惩罚自动衰减为 0，允许转弯。
-            "yaw_scale": 0.30,
+            **TURNING_SOFT_GATE_PARAMS,
             "action_name": "joint_pos",
             # action 顺序：
             "action_indices": (0, 1),
