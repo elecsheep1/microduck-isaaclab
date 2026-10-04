@@ -46,6 +46,41 @@ def base_lin_vel_xy_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scene
     # 计算平方和后得到每个环境的平面速度损失
     return torch.sum(torch.square(root_lin_vel_b[:, :2]), dim=1)
 
+def stand_vertical_velocity_exp(
+        env: ManagerBasedRLEnv,
+        command_name: str,
+        command_threshold: float,
+        yaw_threshold: float,
+        std: float,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """奖励零速度命令下机身竖直速度接近零。
+
+    该项只在“没有平面移动命令、也没有转向命令”时启用。
+    它直接抑制蹲起、上下弹跳等站立抖动；行走和转弯时返回 0，
+    因此不会干扰正常摆腿、起落脚或速度跟踪。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    command = env.command_manager.get_command(command_name)
+
+    linear_speed = torch.linalg.norm(command[:, :2], dim=1)
+
+    standing = (
+        (linear_speed <= command_threshold)
+        & (torch.abs(command[:, 2]) <= yaw_threshold)
+    )
+
+    # root_lin_vel_b 是机体坐标系中的基座线速度。
+    # 第 2 列是竖直方向速度；理想站立时应接近 0。
+    vertical_velocity = asset.data.root_lin_vel_b.torch[:, 2]
+
+    # 速度为 0 时奖励为 1；速度达到 std 时约降为 exp(-1)。
+    reward = torch.exp(-torch.square(vertical_velocity / std))
+
+    # 非站立状态不施加该项，避免影响正常行走。
+    return reward * standing.float()
+
 
 def biped_air_time(env: ManagerBasedRLEnv, command_name: str, threshold: float, command_threshold: float, sensor_cfg: SceneEntityCfg,) -> torch.Tensor:
     """奖励双足行走时的单脚支撑与另一脚摆动。
@@ -177,8 +212,19 @@ def adaptive_gait_phase(
         1.0,
     )
 
-    # 对刚 reset 的环境强制从相位 0 开始。
-    phase = torch.where(restarted, torch.zeros_like(phase), phase)
+    # 只有线速度和转向速度都足够小时，才认定为“站立”。
+    standing = (
+        (speed <= command_threshold)
+        & (torch.abs(command[:, 2]) <= 0.05)
+    )
+
+    # reset 和站立都使用固定相位 0。
+    # 这样零速度命令不再看到持续变化的相位时钟，也就不会被诱导继续踏步。
+    phase = torch.where(
+        restarted | standing,
+        torch.zeros_like(phase),
+        phase,
+    )
 
     # 保存本次结果和当前步数，下次调用时从这里继续计算。
     # 如果同一个控制步内再次调用，步数差为 0，因此不会重复推进相位。

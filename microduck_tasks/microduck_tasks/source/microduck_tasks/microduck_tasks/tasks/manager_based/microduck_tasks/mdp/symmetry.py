@@ -109,7 +109,24 @@ def _mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
     #   sin(phi + pi) = -sin(phi)
     #   cos(phi + pi) = -cos(phi)
     # 所以两个分量都取负号。
-    mirrored[:, 6:8] = -obs[:, 6:8]
+
+    # 行走时，左右镜像对应相位平移半周期。
+    mirrored_phase = -obs[:, 6:8]
+
+    # standing 时相位固定为 [0, 1]，左右镜像后也应保持不变。
+    #
+    # 观测内 [3:6] 是 [vx, vy, yaw_rate]，与环境里的 standing 判定保持一致。
+    command_speed = torch.linalg.norm(obs[:, 3:5], dim=1)
+    standing = (
+        (command_speed <= 0.02)
+        & (torch.abs(obs[:, 5]) <= 0.05)
+    )
+    mirrored_phase = torch.where(
+        standing.unsqueeze(1),
+        obs[:, 6:8],
+        mirrored_phase,
+    )
+    mirrored[:, 6:8] = mirrored_phase
 
     # projected_gravity 是重力方向这个极向量在机器人坐标系中的表示。
     # 左右镜像只改变 y 方向，因此 [gx, gy, gz] 变成 [gx, -gy, gz]。

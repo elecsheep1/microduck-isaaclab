@@ -189,6 +189,20 @@ class RewardsCfg:
     #     weight=-0.02,
     # )
 
+    # 零速度命令下抑制机身上下起伏。
+    #
+    # 只对 standing 环境生效；正常走路、转弯时该奖励恒为 0。
+    stand_vertical_velocity = RewTerm(
+        func=mdp.stand_vertical_velocity_exp,
+        weight=0.25,
+        params={
+            "command_name": "base_velocity",
+            "command_threshold": 0.02,
+            "yaw_threshold": 0.05,
+            "std": 0.03,
+        },
+    )
+
     # 惩罚动作在连续时间步的变化过大。
     action_rate = RewTerm(
         func=mdp.action_rate_l2,
