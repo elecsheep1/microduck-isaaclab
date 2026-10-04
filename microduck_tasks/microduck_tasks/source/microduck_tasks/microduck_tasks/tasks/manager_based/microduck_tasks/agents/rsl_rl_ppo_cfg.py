@@ -5,7 +5,14 @@
 
 from isaaclab.utils.configclass import configclass
 
-from isaaclab_rl.rsl_rl import RslRlMLPModelCfg, RslRlOnPolicyRunnerCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import (
+    RslRlMLPModelCfg, 
+    RslRlOnPolicyRunnerCfg, 
+    RslRlPpoAlgorithmCfg, 
+    RslRlSymmetryCfg,
+)
+
+from ..mdp import symmetry
 
 
 @configclass
@@ -38,6 +45,13 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
+
+        symmetry_cfg=RslRlSymmetryCfg(
+            # 启用数据增强：每个 PPO mini-batch 增加一份左右镜像样本。
+            use_data_augmentation=True,
+            use_mirror_loss=False,
+            data_augmentation_func=symmetry.compute_symmetry_states,
+        ),
     )
 
 

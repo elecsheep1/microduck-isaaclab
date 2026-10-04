@@ -271,6 +271,7 @@ class RewardsCfg:
         },
     )
 
+    # swing和contact相位惩罚
     phase_swing_contact_penalty = RewTerm(
         func=mdp.phase_swing_contact_penalty,
         weight=-0.0,
@@ -288,6 +289,7 @@ class RewardsCfg:
     )
 
     # 奖励摆动脚相对起跳姿态的抬升，减少低空拖脚。
+    # 抬脚奖励
     swing_foot_lift = RewTerm(
         func=mdp.SwingFootLiftReward,
         weight=0.20,
@@ -307,9 +309,10 @@ class RewardsCfg:
         },
     )
 
+    # 接触占空比平衡惩罚
     contact_duty_balance = RewTerm(
         func=mdp.ContactDutyBalance,
-        weight=-0.0,
+        weight=-0.00,
         params={
             **GAIT_PHASE_PARAMS,
             "yaw_threshold": 0.05,
@@ -323,9 +326,7 @@ class RewardsCfg:
         },
     )
 
-    # 直行时鼓励左右腿在半周期后呈镜像轨迹；
-    # 偏航命令增大时自动减弱，避免限制未来的差速转弯。
-    # v2：只有髋、膝确实在主动摆动时才奖励左右腿半周期后的镜像关系
+    # 半周期镜像奖励
     half_cycle_active_joint_symmetry = RewTerm(
         func=mdp.HalfCycleActiveJointSymmetry,
         weight=0.00,
