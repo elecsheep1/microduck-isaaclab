@@ -236,6 +236,7 @@ class RewardsCfg:
         func=mdp.feet_slide,
         weight=-0.6,
         params={
+            **FOOT_CONTACT_FORCE_PARAMS,
             "sensor_cfg": SceneEntityCfg(
                 "feet_contact",
                 body_names=[

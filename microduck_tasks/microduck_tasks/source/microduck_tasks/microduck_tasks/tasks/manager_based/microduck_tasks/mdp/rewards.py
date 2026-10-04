@@ -123,7 +123,12 @@ def biped_air_time(env: ManagerBasedRLEnv, command_name: str, threshold: float, 
     return reward * active
 
 
-def feet_slide(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),) -> torch.Tensor:
+def feet_slide(
+        env: ManagerBasedRLEnv,
+        force_threshold: float,
+        sensor_cfg: SceneEntityCfg,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ) -> torch.Tensor:
     """惩罚足端在接触地面时的水平滑移。
 
     若脚在地面上仍有明显的水平速度，说明它正在滑动，
@@ -135,7 +140,12 @@ def feet_slide(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, asset_cfg: Sc
     # 仅在脚处于接触状态时计算滑移惩罚；
     # 这里用接触力大小判断脚是否落地，超过阈值即认为有接触
     contacts = (
-        contact_sensor.data.net_forces_w_history.torch[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
+        contact_sensor.data.net_forces_w_history.torch[
+            :, :, sensor_cfg.body_ids, :
+            ]
+            .norm(dim=-1)
+            .max(dim=1)[0]
+            > force_threshold
     )
 
     # 取出机器人脚部在世界坐标下的线速度，保留 XY 水平分量
@@ -217,16 +227,9 @@ def adaptive_gait_phase(
         1.0,
     )
 
-    # 只有线速度和转向速度都足够小时，才认定为“站立”。
-    standing = (
-        (speed <= command_threshold)
-        & (torch.abs(command[:, 2]) <= STANDING_YAW_RATE_THRESHOLD)
-    )
-
-    # reset 和站立都使用固定相位 0。
-    # 这样零速度命令不再看到持续变化的相位时钟，也就不会被诱导继续踏步。
+    # 仅在环境 reset 时让相位从 0 重新开始。
     phase = torch.where(
-        restarted | standing,
+        restarted,
         torch.zeros_like(phase),
         phase,
     )
@@ -266,8 +269,26 @@ def gait_phase_sin_cos(
         fast_speed=fast_speed,
         command_threshold=command_threshold,
     )
-    # 将一整个周期 [0, 1) 映射为角度 [0, 2*pi)；phase=0.5 对应 pi。
-    angle = 2.0 * torch.pi * phase
+    # 共享相位仍持续推进，但 policy 在 standing 时不需要步态时钟
+    command = env.command_manager.get_command(command_name)
+    linear_speed = torch.linalg.norm(command[:, :2], dim=1)
+
+    standing = (
+        (linear_speed <= command_threshold)
+        & (torch.abs(command[:, 2]) <= STANDING_YAW_RATE_THRESHOLD)
+    )
+
+    # 仅覆盖给 policy 的观测相位：
+    # standing -> phase 0 -> [sin(0), cos(0)] = [0, 1]。
+    # 行走 / 原地转向 -> 保留连续共享相位。
+    phase_for_observation = torch.where(
+        standing,
+        torch.zeros_like(phase),
+        phase,
+    )
+
+    angle = 2.0 * torch.pi * phase_for_observation
+
     # 每个环境生成两个特征：[sin(angle), cos(angle)]。
     return torch.stack(
         (torch.sin(angle), torch.cos(angle)),
