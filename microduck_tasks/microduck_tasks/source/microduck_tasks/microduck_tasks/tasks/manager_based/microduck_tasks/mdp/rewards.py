@@ -78,7 +78,9 @@ def biped_air_time(env: ManagerBasedRLEnv, command_name: str, threshold: float, 
         env.command_manager.get_command(command_name)[:, :2],
         dim=1,
     )
-    return reward * (command_speed > command_threshold)
+    active = command_speed > command_threshold
+
+    return reward * active
 
 
 def feet_slide(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),) -> torch.Tensor:
@@ -263,7 +265,7 @@ def phase_foot_contact(
             :, :, sensor_cfg.body_ids, :
         ]
         .norm(dim=-1)
-        .max(dim=1)[0]
+        .max(dim=1)[0]     # 沿历史时间维度取最大值
         > force_threshold
     )
     # 当前步态相位，范围在 [0,1)
@@ -338,6 +340,406 @@ def phase_foot_contact(
     reward = contact_match - 0.5
 
     return reward * (command_speed > command_threshold)
+
+def phase_swing_contact_penalty(
+        env:ManagerBasedRLEnv,
+        command_name: str,
+        period_s:float,
+        slow_period_s:float,
+        slow_speed:float,
+        fast_speed:float,
+        command_threshold:float,
+        slow_stance_fraction:float,
+        fast_stance_fraction:float,
+        transition_fraction:float,
+        yaw_scale: float,
+        force_threshold:float,
+        sensor_cfg:SceneEntityCfg,
+    ) -> torch.Tensor:
+    """惩罚脚在高置信摆动阶段仍接触地面。
+
+    使用与 phase_foot_contact() 完全相同的速度自适应相位、
+    支撑占空比和软接触目标。
+
+    仅当某脚明确应该离地时施加明显惩罚；
+    在落脚、离脚过渡区，惩罚会自动减弱，允许合理双支撑。
+    """
+
+    # 读取左右脚接触状态。
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    contacts = (
+        contact_sensor.data.net_forces_w_history.torch[
+            :, :, sensor_cfg.body_ids, :
+        ]
+        .norm(dim=-1)
+        .max(dim=1)[0]
+        > force_threshold
+    )
+
+    # 使用同一个累计自适应相位
+    phase = adaptive_gait_phase(
+        env,
+        command_name=command_name,
+        period_s=period_s,
+        slow_period_s=slow_period_s,
+        slow_speed=slow_speed,
+        fast_speed=fast_speed,
+        command_threshold=command_threshold,
+    )
+
+    # 计算当前平面速度和速度插值比例
+    command_speed = torch.linalg.norm(
+        env.command_manager.get_command(command_name)[:, :2], dim=1
+    )
+
+    yaw_gate = torch.exp(
+        -torch.square(env.command_manager.get_command(command_name)[:, 2] / yaw_scale)
+    )
+
+    # 直行走路时启用；静止、原地转向时不约束。
+    active = (command_speed > command_threshold) * yaw_gate
+
+    speed_ratio = (
+        (command_speed - slow_speed) / (fast_speed - slow_speed)
+    ).clamp(0.0, 1.0)
+
+    # 低速支撑时间更长，高速更接近交替支撑。
+    stance_fraction = (
+        slow_stance_fraction + (fast_stance_fraction - slow_stance_fraction) * speed_ratio
+    )
+
+    # 左右脚相差半周期。先左脚再右脚
+    leg_phase = torch.stack(
+        (
+            phase,
+            torch.remainder(phase + 0.5, 1.0),
+        ),
+        dim=1,
+    )
+
+    # 环形相位距离
+    stance_center = 0.5 * stance_fraction.unsqueeze(1)
+    phase_distance = torch.abs(
+        torch.remainder(
+            leg_phase - stance_center + 0.5,
+            1.0,
+        ) - 0.5
+    )
+
+    # q 接近 1：期望接触；q 接近 0：期望摆动。
+    desired_contact_prob = torch.sigmoid(
+        (
+            0.5 * stance_fraction.unsqueeze(1) - phase_distance
+        ) / transition_fraction
+    )
+
+    # 仅在“明确应该摆动”的阶段惩罚接触。
+    #
+    # q = 0.0 -> 系数 1.0，若脚仍接触则最大惩罚；
+    # q = 1.0 -> 系数 0.0，支撑脚接触不受惩罚；
+    # q = 0.5 -> 系数 0.25，换脚边界仅轻微惩罚。
+    swing_contact_error = (
+        contacts.float() * torch.square(1.0 - desired_contact_prob)
+    ).mean(dim=1)
+
+    return swing_contact_error * active.float()
+
+class SwingFootLiftReward(ManagerTermBase):
+    """奖励摆动脚相对起跳位置的抬升量。
+
+    只在相位表明该脚处于摆动段时生效。高度使用“脚相对机身的 z 坐标”，
+    因而机器人整体上下跳不会凭空获得奖励。
+    """
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+
+        # 每个环境、每只脚分别记录本次摆动起点的相对高度。
+        self._takeoff_rel_z = torch.zeros(
+            env.num_envs,
+            2,
+            device=env.device,
+        )
+
+        # 记录上一控制步是否处于摆动段，用于检测“刚进入摆动”。
+        self._was_swing = torch.zeros(
+            env.num_envs,
+            2,
+            dtype=torch.bool,
+            device=env.device,
+        )
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        """环境重置时清除上一回合的起跳记录。"""
+        if env_ids is None:
+            self._takeoff_rel_z.zero_()
+            self._was_swing.zero_()
+        else:
+            self._takeoff_rel_z[env_ids] = 0.0
+            self._was_swing[env_ids] = False
+
+    def __call__(
+            self,
+            env: ManagerBasedRLEnv,
+            command_name: str,
+            period_s: float,
+            slow_period_s: float,
+            slow_speed: float,
+            fast_speed: float,
+            command_threshold: float,
+            slow_stance_fraction: float,
+            fast_stance_fraction: float,
+            transition_fraction: float,
+            target_lift: float,
+            asset_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        """返回每个环境的摆动脚抬升奖励。"""
+
+        asset: Articulation = env.scene[asset_cfg.name]
+
+        phase = adaptive_gait_phase(
+            env,
+            command_name=command_name,
+            period_s=period_s,
+            slow_period_s=slow_period_s,
+            slow_speed=slow_speed,
+            fast_speed=fast_speed,
+            command_threshold=command_threshold,
+        )
+
+        command = env.command_manager.get_command(command_name)
+        command_speed = torch.linalg.norm(command[:, :2], dim=1)
+
+        speed_ratio = ((command_speed - slow_speed) / (fast_speed - slow_speed)).clamp(0.0, 1.0)
+
+        stance_fraction = (
+            slow_stance_fraction + (fast_stance_fraction - slow_stance_fraction) * speed_ratio
+        )
+
+        # 左、右脚相差半周期。
+        leg_phase = torch.stack((phase, torch.remainder(phase + 0.5, 1.0)), dim=1)
+
+        # 环形计算
+        stance_center = 0.5 * stance_fraction.unsqueeze(1)
+        phase_distance = torch.abs(
+            torch.remainder(leg_phase - stance_center + 0.5, 1.0) - 0.5
+        )
+
+        # q 接近 1 表示支撑期，接近 0 表示摆动期。
+        desired_contact_prob = torch.sigmoid(
+            (0.5 * stance_fraction.unsqueeze(1) - phase_distance) / transition_fraction
+        )
+
+        # 仅用明确摆动区检测，避免边界软过渡反复触发。
+        is_swing = desired_contact_prob < 0.5
+        swing_started = is_swing & (~self._was_swing)
+
+        # 脚相对机身的高度：可抵消整体机身上下运动。
+        foot_rel_z = (
+            asset.data.body_pos_w.torch[:, asset_cfg.body_ids, 2]
+            - asset.data.root_pos_w.torch[:, None, 2]
+        )
+
+        # 进入摆动的第一帧记录抬起参考高度。
+        self._takeoff_rel_z = torch.where(
+            swing_started,
+            foot_rel_z,
+            self._takeoff_rel_z,
+        )
+
+        # 相对抬起点的向上位移；低于抬起点高度不产生负奖励。
+        lift = torch.clamp(
+            foot_rel_z - self._takeoff_rel_z,
+            min=0.0,
+        )
+
+        # 达到 target_lift 后饱和，避免策略无意义地高抬腿。
+        lift_score = torch.clamp(
+            lift / target_lift,
+            min=0.0,
+            max=1.0,
+        )
+
+        # 在摆动段中心权重最大；接近落脚/离脚边界时自然减弱。
+        swing_confidence = 1.0 - desired_contact_prob
+        reward = (lift_score * swing_confidence).mean(dim=1)
+
+        # 保存当前摆动状态，供下一控制步判断是否刚进入摆动。
+        self._was_swing = is_swing
+
+        return reward * (command_speed > command_threshold).float()
+
+
+class ContactDutyBalance(ManagerTermBase):
+    """惩罚完整步态周期内左右脚累计支撑时长不平衡。
+
+    该项不要求每一个时刻两脚接触状态相同。
+    它只要求经过一个完整周期后，左右脚实际支撑总时长接近。
+
+    因此：
+    - 正常左右交替步态：左右累计接触时长接近，惩罚小；
+    - 一条腿长期赖在地上：左右累计接触时长不同，惩罚增大；
+    - 双脚全程接触：该项本身不会惩罚，需由 swing-contact 项处理。
+    """
+
+    def __init__(
+        self,
+        cfg: RewardTermCfg,
+        env: ManagerBasedRLEnv,
+    ):
+        super().__init__(cfg, env)
+
+        self._left_contact_time = torch.zeros(
+            env.num_envs,
+            device=env.device,
+        )
+        self._right_contact_time = torch.zeros(
+            env.num_envs,
+            device=env.device,
+        )
+        self._elapsed_time = torch.zeros(
+            env.num_envs,
+            device=env.device,
+        )
+        self._previous_phase = torch.zeros(
+            env.num_envs,
+            device=env.device,
+        )
+
+        # 保存上一个完整周期的失衡程度，
+        # 让惩罚在下一个周期中持续生效，而不是只在相位回绕那一帧出现。
+        self._last_imbalance = torch.zeros(
+            env.num_envs,
+            device=env.device,
+        )
+
+    def reset(
+            self,
+            env_ids: Sequence[int] | None = None,
+    ) -> None:
+        if env_ids is None:
+            self._left_contact_time.zero_()
+            self._right_contact_time.zero_()
+            self._elapsed_time.zero_()
+            self._previous_phase.zero_()
+            self._last_imbalance.zero_()
+        else:
+            self._left_contact_time[env_ids] = 0.0
+            self._right_contact_time[env_ids] = 0.0
+            self._elapsed_time[env_ids] = 0.0
+            self._previous_phase[env_ids] = 0.0
+            self._last_imbalance[env_ids] = 0.0
+
+    def __call__(
+            self,
+            env: ManagerBasedRLEnv,
+            command_name: str,
+            period_s: float,
+            slow_period_s: float,
+            slow_speed: float,
+            fast_speed: float,
+            command_threshold: float,
+            yaw_threshold: float,
+            min_cycle_time_s: float,
+            force_threshold: float,
+            sensor_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        """返回上一个完整周期的左右接触时长差，范围约为 [0, 1]。"""
+
+        command = env.command_manager.get_command(command_name)
+        command_speed = torch.linalg.norm(
+            command[:, :2], dim=1
+        )
+
+        # 只在直行且有明确前进命令时累计。
+        active = (
+            (command_speed > command_threshold)
+            & (torch.abs(command[:, 2]) <= yaw_threshold)
+        )
+
+        contact_sensor = env.scene.sensors[sensor_cfg.name]
+        contacts = (
+            contact_sensor.data.net_forces_w_history.torch[
+                :, :, sensor_cfg.body_ids, :
+            ]
+            .norm(dim=-1)
+            .max(dim=1)[0]
+            > force_threshold
+        ).float()
+
+        phase = adaptive_gait_phase(
+            env,
+            command_name=command_name,
+            period_s=period_s,
+            slow_period_s=slow_period_s,
+            slow_speed=slow_speed,
+            fast_speed=fast_speed,
+            command_threshold=command_threshold,
+        )
+
+        # phase 从接近 1 回到接近 0，表示刚完成一个完整周期。
+        cycle_finished = (
+            active
+            & (phase < self._previous_phase)
+            & (self._elapsed_time >= min_cycle_time_s)
+        )
+
+        # 用已完成周期内的累计接触时间计算左右支撑比例之差。
+        completed_imbalance = torch.abs(
+            self._left_contact_time - self._right_contact_time
+        ) / self._elapsed_time.clamp_min(1e-6)
+
+        # 周期结束时更新并保存本周期失衡度。
+        self._last_imbalance = torch.where(
+            active,
+            torch.where(
+                cycle_finished,
+                completed_imbalance,
+                self._last_imbalance,
+            ),
+            torch.zeros_like(self._last_imbalance),
+        )
+
+        # 周期结束后清零旧累计量；当前控制步会随后作为新周期的第一帧加入。
+        left_time = torch.where(
+            cycle_finished,
+            torch.zeros_like(self._left_contact_time),
+            self._left_contact_time
+        )
+        right_time = torch.where(
+            cycle_finished,
+            torch.zeros_like(self._right_contact_time),
+            self._right_contact_time,
+        )
+        elapsed_time = torch.where(
+            cycle_finished,
+            torch.zeros_like(self._elapsed_time),
+            self._elapsed_time,
+        )
+
+        # 仅 active 环境继续累计；不走路或转弯时清空状态，避免跨模式比较。
+        self._left_contact_time = torch.where(
+            active,
+            left_time + contacts[:, 0] * env.step_dt,
+            torch.zeros_like(left_time),
+        )
+        self._right_contact_time = torch.where(
+            active,
+            right_time + contacts[:, 1] * env.step_dt,
+            torch.zeros_like(right_time),
+        )
+        self._elapsed_time = torch.where(
+            active,
+            elapsed_time + env.step_dt,
+            torch.zeros_like(elapsed_time),
+        )
+
+        self._previous_phase = phase
+
+        # 返回正的失衡误差，因此配置中使用负权重
+        return self._last_imbalance * active.float()
+
+        
+
 
 class HalfCycleActiveJointSymmetry(ManagerTermBase):
     """奖励左右腿在相位相隔半周期时的镜像关节运动。
@@ -489,13 +891,14 @@ class HalfCycleActiveJointSymmetry(ManagerTermBase):
 
         # 按环形写入指针计算各槽位距今的步数；reset 后尚未写入的槽位无效。
         # `age` 表示：每个槽位里的数据距离当前有多少个控制步
+        # 环境0 (valid_steps=3):   age=[1,2,3,4,5] <= 3  →  [T, T, T, F, F]
         age = (self._write_index - 1 - slot_ids) % self._history_len + 1
         valid = age.unsqueeze(0) <= self._valid_steps.unsqueeze(1)
 
         # 在 [0, 1) 的环形相位上计算历史状态到当前状态的相位进度。
         # 因此不会把更早的整周期误认成半周期；改动周期范围时需重新核对这一条件。
         phase_advance = torch.remainder(
-            phase[:, None] - self._phase_history,
+            phase.unsqueeze(1) - self._phase_history,
             1.0,
         )
         # 与半周期 0.5 的距离；无效槽位不能参与最小误差选择。

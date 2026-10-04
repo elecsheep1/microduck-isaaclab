@@ -92,6 +92,29 @@ class CommandsCfg:
         ),
     )
 
+# 参数字典
+GAIT_PHASE_PARAMS = {
+    "command_name": "base_velocity",
+    # 中高速时的完整步态周期：左、右各完成一次摆动为一个周期。
+    "period_s": 0.60,
+
+    # 慢速时采用的完整步态周期。
+    "slow_period_s": 0.60,
+
+    # 线速度低于 slow_speed 时使用慢速周期；
+    # 高于 fast_speed 时使用 period_s；中间连续插值。
+    "slow_speed": 0.04,
+    "fast_speed": 0.12,
+
+    # 速度低于该值时视为站立，不推进自适应步态相位。
+    "command_threshold": 0.02,
+}
+
+GAIT_CONTACT_SCHEDULE_PARAMS = {
+    "slow_stance_fraction": 0.62,
+    "fast_stance_fraction": 0.52,
+    "transition_fraction": 0.04,
+}
 
 @configclass
 class ObservationsCfg:
@@ -108,12 +131,7 @@ class ObservationsCfg:
         gait_phase = ObsTerm(
             func=mdp.gait_phase_sin_cos,
             params={
-                "command_name": "base_velocity",
-                "period_s": 0.60,
-                "slow_period_s": 0.72,
-                "slow_speed": 0.04,
-                "fast_speed": 0.12,
-                "command_threshold": 0.02,
+                **GAIT_PHASE_PARAMS,
             },
         )        
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
@@ -200,7 +218,7 @@ class RewardsCfg:
     # 鼓励行走时形成“单脚支撑、另一脚摆动”的节奏。
     air_time = RewTerm(
         func=mdp.biped_air_time,
-        weight=3.0,
+        weight=2.0,
         params={
             "command_name": "base_velocity",
             "threshold": 0.15,
@@ -242,15 +260,60 @@ class RewardsCfg:
         func=mdp.phase_foot_contact,
         weight=1.0,
         params={
-            "command_name": "base_velocity",
-            "period_s": 0.60,
-            "slow_period_s": 0.72,
-            "slow_speed": 0.04,
-            "fast_speed": 0.12,
-            "command_threshold": 0.02,
-            "slow_stance_fraction": 0.62,
-            "fast_stance_fraction": 0.52,
-            "transition_fraction": 0.04,
+            **GAIT_PHASE_PARAMS,
+            **GAIT_CONTACT_SCHEDULE_PARAMS,
+            "force_threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=["ankle_left", "ankle_right"],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    phase_swing_contact_penalty = RewTerm(
+        func=mdp.phase_swing_contact_penalty,
+        weight=-0.0,
+        params={
+            **GAIT_PHASE_PARAMS,
+            **GAIT_CONTACT_SCHEDULE_PARAMS,
+            "yaw_scale": 0.30,
+            "force_threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=["ankle_left", "ankle_right"],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    # 奖励摆动脚相对起跳姿态的抬升，减少低空拖脚。
+    swing_foot_lift = RewTerm(
+        func=mdp.SwingFootLiftReward,
+        weight=0.20,
+        params={
+            **GAIT_PHASE_PARAMS,
+            **GAIT_CONTACT_SCHEDULE_PARAMS,
+
+            # 目标抬升 0.8 cm；达到后奖励饱和。
+            # 先从较保守的数值开始，避免学成高抬腿或跳跃。
+            "target_lift": 0.008,
+
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["ankle_left", "ankle_right"],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    contact_duty_balance = RewTerm(
+        func=mdp.ContactDutyBalance,
+        weight=-0.0,
+        params={
+            **GAIT_PHASE_PARAMS,
+            "yaw_threshold": 0.05,
+            "min_cycle_time_s": 0.45,
             "force_threshold": 1.0,
             "sensor_cfg": SceneEntityCfg(
                 "feet_contact",
@@ -265,14 +328,9 @@ class RewardsCfg:
     # v2：只有髋、膝确实在主动摆动时才奖励左右腿半周期后的镜像关系
     half_cycle_active_joint_symmetry = RewTerm(
         func=mdp.HalfCycleActiveJointSymmetry,
-        weight=0.03,
+        weight=0.00,
         params={
-            "command_name": "base_velocity",
-            "period_s": 0.60,
-            "slow_period_s": 0.72,
-            "slow_speed": 0.04,
-            "fast_speed": 0.12,
-            "command_threshold": 0.02,# 命令平面速度低于该值时不给对称奖励。防止静止时机器人为了镜像而无意义摆腿。
+            **GAIT_PHASE_PARAMS,
             "yaw_scale": 0.30,
             "std": 0.25,
             "roll_std": 0.25,
