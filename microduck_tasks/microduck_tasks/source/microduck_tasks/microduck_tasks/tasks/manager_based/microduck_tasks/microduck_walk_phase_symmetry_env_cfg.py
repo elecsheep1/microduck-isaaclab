@@ -339,17 +339,17 @@ class RewardsCfg:
         },
     )
 
-    # 惩罚摆动脚抬得过高。
+    # 惩罚离地脚抬得过高。
     #
     # 2.0 cm 以下不惩罚；
     # 从 2.0 cm 到 3.0 cm 之间平方增长；
     # 超过 3.0 cm 后惩罚饱和。
     swing_foot_excess_lift = RewTerm(
         func= mdp.SwingFootExcessLiftPenalty,
-        weight=-0.05,
+        weight=-0.25,
         params={
-            **GAIT_PHASE_PARAMS,
-            **GAIT_CONTACT_SCHEDULE_PARAMS,
+            **WALKING_GATE_PARAMS,
+            **FOOT_CONTACT_FORCE_PARAMS,
 
             # 允许的最大抬升高度。
             "max_lift": 0.020,
@@ -360,6 +360,11 @@ class RewardsCfg:
             "asset_cfg": SceneEntityCfg(
                 "robot",
                 body_names=["ankle_left","ankle_right"],
+                preserve_order=True,
+            ),
+            "sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=["ankle_left", "ankle_right"],
                 preserve_order=True,
             ),
         },
