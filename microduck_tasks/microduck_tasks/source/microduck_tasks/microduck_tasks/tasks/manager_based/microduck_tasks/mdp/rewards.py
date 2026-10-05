@@ -115,13 +115,25 @@ def biped_air_time(env: ManagerBasedRLEnv, command_name: str, threshold: float, 
     # 若在接触，则取接触时间；否则取空中时间
     mode_time = torch.where(in_contact, contact_time, air_time)
 
-    # 只有恰好一只脚接触地面时，才认为是合理的单脚支撑状态
-    single_stance = torch.sum(in_contact.int(), dim=1) == 1
-    # 对非单脚支撑状态置零，只保留单脚支撑期间的有效时间
-    reward = torch.min(torch.where(single_stance.unsqueeze(-1), mode_time, 0.0), dim=1)[0]
+    # 当前接触脚数量：0 = 腾空，1 = 单脚支撑，2 = 双支撑。
+    contact_count = torch.sum(in_contact.int(), dim=1)
 
-    # 限制最大奖励值，避免极端情况下奖励过大
-    reward = torch.clamp(reward, max=threshold)
+    # 只有恰好一只脚接触地面时，才认为是合理的单脚支撑状态
+    single_stance = contact_count == 1
+
+    single_reward = torch.min(
+        torch.where(single_stance.unsqueeze(-1), mode_time, 0.0),
+        dim=1,
+    )[0]
+    single_reward = torch.clamp(single_reward, max=threshold)
+
+    # 双支撑允许在换脚瞬间短暂出现，因此只给较弱惩罚。
+    double_support_penalty = 0.01 * (contact_count == 2).float()
+
+    # 两脚腾空正是跳跃模式；惩罚设置得比双支撑更强。
+    flight_penalty = 0.04 * (contact_count == 0).float()
+
+    reward = single_reward - double_support_penalty - flight_penalty
 
     # 只有当前命令速度高于阈值时才给奖励，避免静止时也获得步态奖励
     command_speed = torch.linalg.norm(
