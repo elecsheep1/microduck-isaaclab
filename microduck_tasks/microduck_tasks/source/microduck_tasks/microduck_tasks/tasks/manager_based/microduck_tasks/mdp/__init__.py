@@ -20,6 +20,7 @@ from .rewards import (
     phase_foot_contact,
     phase_swing_contact_penalty,
     SwingFootLiftReward,
+    SwingFootExcessLiftPenalty,
     ContactDutyBalance,
     HalfCycleActiveJointSymmetry,
     # hip_yaw_neutral_l1,

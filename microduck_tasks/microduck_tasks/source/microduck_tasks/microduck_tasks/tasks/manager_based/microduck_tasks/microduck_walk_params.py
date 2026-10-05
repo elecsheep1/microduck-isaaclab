@@ -13,7 +13,7 @@ STANDING_YAW_RATE_THRESHOLD: Final = 0.05  #rad/s
 # 中高速时的完整步态周期：左、右各完成一次摆动为一个周期。
 GAIT_PERIOD_S: Final = 0.60
 # 慢速时采用的完整步态周期。
-GAIT_SLOW_PERIOD_S: Final = 0.60
+GAIT_SLOW_PERIOD_S: Final = 0.80
 # 线速度低于 slow_speed 时使用慢速周期；
 # 高于 fast_speed 时使用 period_s；中间连续插值。
 GAIT_SLOW_SPEED: Final = 0.04

@@ -97,9 +97,10 @@ class CommandsCfg:
         debug_vis=True, #在 Kit 可视化中显示速度指令的调试标记
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
             lin_vel_x=(0.04, 0.18),
+            # lin_vel_x=(0.00, 0.00),
             lin_vel_y=(0.0, 0.0),
-            ang_vel_z=(-0.30, 0.30),
-            # ang_vel_z=(-0.00, 0.00),
+            # ang_vel_z=(-0.30, 0.30),
+            ang_vel_z=(-0.00, 0.00),
         ),
     )
 
@@ -333,6 +334,32 @@ class RewardsCfg:
             "asset_cfg": SceneEntityCfg(
                 "robot",
                 body_names=["ankle_left", "ankle_right"],
+                preserve_order=True,
+            ),
+        },
+    )
+
+    # 惩罚摆动脚抬得过高。
+    #
+    # 2.0 cm 以下不惩罚；
+    # 从 2.0 cm 到 3.0 cm 之间平方增长；
+    # 超过 3.0 cm 后惩罚饱和。
+    swing_foot_excess_lift = RewTerm(
+        func= mdp.SwingFootExcessLiftPenalty,
+        weight=-0.05,
+        params={
+            **GAIT_PHASE_PARAMS,
+            **GAIT_CONTACT_SCHEDULE_PARAMS,
+
+            # 允许的最大抬升高度。
+            "max_lift": 0.020,
+
+            # 超过 max_lift 后，在 1.0 cm 范围内增长至最大惩罚。
+            "excess_range": 0.010,
+
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["ankle_left","ankle_right"],
                 preserve_order=True,
             ),
         },

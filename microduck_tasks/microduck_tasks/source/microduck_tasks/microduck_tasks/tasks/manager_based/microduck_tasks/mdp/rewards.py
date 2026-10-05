@@ -769,6 +769,185 @@ class SwingFootLiftReward(ManagerTermBase):
         return reward * (command_speed > command_threshold).float()
 
 
+class SwingFootExcessLiftPenalty(ManagerTermBase):
+    """惩罚摆动脚相对本次摆动起点抬得过高。
+
+    足端高度使用世界坐标系，并减去进入摆动相位时记录的足端高度。
+    因此计算的是本次摆动的实际抬升量，与评估器中的 lift 定义一致。
+
+    当抬升量不超过 max_lift 时不产生惩罚；
+    超过 max_lift 后，惩罚在 excess_range 范围内平方增长；
+    超过 max_lift + excess_range 后惩罚饱和，避免异常状态产生极大值。
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv,):
+        super().__init__(cfg, env)
+
+        # 每个环境、每只脚分别记录本次摆动开始时的世界系高度。
+        self._takeoff_z = torch.zeros(
+            env.num_envs,
+            2,
+            device=env.device,
+        )
+
+        # 记录上一控制步中左右脚是否处于摆动相位，
+        # 用于检测“刚刚进入摆动相位”的控制步。
+        self._was_swing = torch.zeros(
+            env.num_envs,
+            2,
+            dtype=torch.bool,
+            device=env.device,
+        )
+
+        # 提前检查配置，避免除以 0。
+        excess_range = float(cfg.params["excess_range"])
+        if excess_range <= 0.0:
+            raise ValueError(
+                "SwingFootExcessLiftPenalty requires excess_range > 0."
+            )
+
+    def reset(self, env_ids: Sequence[int] | None = None,) -> None:
+        """环境重置时清除上一回合的足端高度和相位记录。"""
+
+        if env_ids is None:
+            self._takeoff_z.zero_()
+            self._was_swing.zero_()
+        else:
+            self._takeoff_z[env_ids] = 0.0
+            self._was_swing[env_ids] = False
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str,
+        period_s: float,
+        slow_period_s: float,
+        slow_speed: float,
+        fast_speed: float,
+        command_threshold: float,
+        slow_stance_fraction: float,
+        fast_stance_fraction: float,
+        transition_fraction: float,
+        max_lift: float,
+        excess_range: float,
+        asset_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        """返回每个环境的摆动脚超高惩罚值。"""
+
+        asset: Articulation = env.scene[asset_cfg.name]
+
+        phase = adaptive_gait_phase(
+            env,
+            command_name=command_name,
+            period_s=period_s,
+            slow_period_s=slow_period_s,
+            slow_speed=slow_speed,
+            fast_speed=fast_speed,
+            command_threshold=command_threshold,
+        )
+
+        command = env.command_manager.get_command(command_name)
+        command_speed = torch.linalg.norm(command[:, :2], dim=1)
+
+        speed_ratio = (
+            (command_speed - slow_speed) / (fast_speed - slow_speed)
+        ).clamp(0.0, 1.0)
+
+        stance_fraction = (
+            slow_stance_fraction + (fast_stance_fraction - slow_stance_fraction) * speed_ratio
+        )
+
+        # 左右脚相差半个步态周期。
+        leg_phase = torch.stack(
+            (
+                phase,
+                torch.remainder(phase + 0.5, 1.0),
+            ),
+            dim=1
+        )
+
+        # 计算各脚当前相位到支撑区中心的环形距离。
+        stance_center = 0.5 * stance_fraction.unsqueeze(1)
+        # 环形计算
+        phase_distance = torch.abs(
+            torch.remainder(
+                leg_phase - stance_center + 0.5,
+                1.0,
+            )
+            - 0.5
+        )
+
+        # 接近 1 表示应该支撑，接近 0 表示应该摆动。
+        desired_contact_prob = torch.sigmoid(
+            (0.5 * stance_fraction.unsqueeze(1) - phase_distance) / transition_fraction
+        )
+
+        # 只把明确位于摆动区域的脚视为摆动脚。
+        is_swing = desired_contact_prob < 0.5
+
+        # 检测每只脚刚进入摆动相位的时刻。
+        swing_started = is_swing & (~self._was_swing)
+
+        # 左右足端在世界坐标系中的当前高度。
+        foot_z = asset.data.body_pos_w.torch[
+            :, asset_cfg.body_ids, 2,
+        ]
+
+        # 进入摆动相位时，保存本次摆动的起始高度。
+        self._takeoff_z = torch.where(
+            swing_started,
+            foot_z,
+            self._takeoff_z,
+        )
+
+        # 本次摆动相对于起始高度的真实抬升量。
+        lift = torch.clamp(
+            foot_z - self._takeoff_z,
+            min=0.0,
+        )
+
+        # 只有超过 max_lift 的部分才进入惩罚。
+        excess_lift = torch.clamp(
+            lift - max_lift,
+            min=0.0,
+        )
+
+        # 将超出量归一化后平方。
+        #
+        # lift <= max_lift：
+        #     excess_score = 0
+        #
+        # lift = max_lift + 0.5 * excess_range：
+        #     excess_score = 0.25
+        #
+        # lift >= max_lift + excess_range：
+        #     excess_score = 1
+        excess_score = torch.square(
+            torch.clamp(
+                excess_lift / excess_range,
+                min=0.0,
+                max=1.0,
+            )
+        )
+
+        # 摆动相位中心惩罚最强，起跳和落脚边界自动减弱。
+        swing_confidence = 1.0 - desired_contact_prob
+
+        # 只统计当前摆动脚。
+        #
+        # 正常双足交替步态中每个时刻通常只有一只摆动脚，
+        # 因此使用 sum，不需要再除以脚的数量。
+        reward = (
+            excess_score * swing_confidence * is_swing.float()
+        ).sum(dim=1)
+
+        # 保存当前摆动状态，供下一控制步使用。
+        self._was_swing = is_swing
+
+        active = command_speed > command_threshold
+
+        return reward * active.float()
+
 class ContactDutyBalance(ManagerTermBase):
     """惩罚完整步态周期内左右脚累计支撑时长不平衡。
 
