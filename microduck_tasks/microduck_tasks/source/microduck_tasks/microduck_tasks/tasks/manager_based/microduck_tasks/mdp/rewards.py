@@ -96,6 +96,109 @@ def stand_vertical_velocity_exp(
     # 非站立状态不施加该项，避免影响正常行走。
     return reward * standing.float()
 
+class JointMechanicalWorkPenalty(ManagerTermBase):
+    """惩罚每个控制间隔内腿部关节的绝对机械功。
+
+    对每个关节计算 |applied_torque * (q_t - q_{t-1})|，
+    再对全部指定关节求和。
+    力矩 X 角位移 约等于 机械功
+
+    使用逐关节绝对值求和，避免不同关节的正功和负功互相抵消。
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env:ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+
+        self._asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self._actuator_name: str = cfg.params["actuator_name"]
+
+        asset: Articulation = env.scene[self._asset_cfg.name]
+        actuator = asset.actuators[self._actuator_name]
+
+        # articulation 的 joint_pos 按全局关节编号排列；
+        # actuator 的 applied_effort 按 actuator.joint_names 排列。
+        # 因此按名称建立两者之间的列映射。
+        # 找出奖励配置中的关节名称
+        selected_joint_names = [
+            asset.joint_names[joint_id]
+            for joint_id in self._asset_cfg.joint_ids
+        ]
+
+        # 检查 actuator 是否控制这些关节
+        missing_joint_names = [
+            name for name in selected_joint_names
+            if name not in actuator.joint_names
+        ]
+        if missing_joint_names:
+            raise ValueError(
+                f"Actuator'{self._actuator_name}' does not control: "
+                f"{missing_joint_names}"
+            )
+
+        # 转换成 GPU 上的整数 Tensor
+        self._actuator_joint_ids = torch.tensor(
+            [actuator.joint_names.index(name) for name in selected_joint_names],
+            device=env.device,
+            dtype=torch.long,
+        )
+
+        # 每个并行环境独立保存上一控制步的关节位置。
+        self._previous_joint_pos = torch.zeros(
+            env.num_envs,
+            len(selected_joint_names),
+            device=env.device,
+        )
+
+        self._has_previous_pos = torch.zeros(
+            env.num_envs,
+            dtype=torch.bool,
+            device=env.device,
+        )
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        """reset 后清空历史，避免把上一回合的末态算成机械功。"""
+        if env_ids is None:
+            self._previous_joint_pos.zero_()
+            self._has_previous_pos.zero_()
+        else:
+            self._previous_joint_pos[env_ids] = 0.0
+            self._has_previous_pos[env_ids] = False
+
+    def __call__(
+            self,
+            env: ManagerBasedRLEnv,
+            actuator_name: str,
+            asset_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        """返回每个环境当前控制间隔的绝对关节机械功近似值。"""
+        # 两个参数由 RewardTermCfg 传入；映射已在 __init__ 完成。
+        # 解绑变量名
+        del actuator_name, asset_cfg
+
+        asset: Articulation = env.scene[self._asset_cfg.name]
+        actuator = asset.actuators[self._actuator_name]
+
+        current_joint_pos = asset.data.joint_pos.torch[
+            :, self._asset_cfg.joint_ids
+        ]
+
+        applied_torque = actuator.applied_effort[
+            :, self._actuator_joint_ids
+        ]
+
+        # Nm * rad，近似当前控制间隔的机械功。
+        joint_displacement = current_joint_pos - self._previous_joint_pos
+        work = torch.sum(
+            torch.abs(applied_torque * joint_displacement),
+            dim=1,
+        )
+
+        # 回合第一帧只建立历史，不施加惩罚。
+        work = work * self._has_previous_pos.float()
+        self._previous_joint_pos.copy_(current_joint_pos)
+        self._has_previous_pos.fill_(True)
+
+        return work
 
 def biped_air_time(env: ManagerBasedRLEnv, command_name: str, threshold: float, command_threshold: float, sensor_cfg: SceneEntityCfg,) -> torch.Tensor:
     """奖励双足行走时的单脚支撑与另一脚摆动。
@@ -133,7 +236,8 @@ def biped_air_time(env: ManagerBasedRLEnv, command_name: str, threshold: float, 
     # 两脚腾空正是跳跃模式；惩罚设置得比双支撑更强。
     flight_penalty = 0.04 * (contact_count == 0).float()
 
-    reward = single_reward - double_support_penalty - flight_penalty
+    # reward = single_reward - double_support_penalty - flight_penalty
+    reward = single_reward
 
     # 只有当前命令速度高于阈值时才给奖励，避免静止时也获得步态奖励
     command_speed = torch.linalg.norm(
@@ -539,16 +643,17 @@ def phase_swing_contact_penalty(
     return swing_contact_error * active.float()
 
 class SwingFootLiftReward(ManagerTermBase):
-    """奖励摆动脚相对起跳位置的抬升量。
+    """奖励摆动脚相对起跳位置的世界系抬升量。
 
-    只在相位表明该脚处于摆动段时生效。高度使用“脚相对机身的 z 坐标”，
-    因而机器人整体上下跳不会凭空获得奖励。
+    只在相位表明该脚处于摆动段时生效。
+    使用足端世界系高度相对于摆动开始时高度的变化，
+    避免机身下蹲被错误计算为足端抬升。
     """
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
 
-        # 每个环境、每只脚分别记录本次摆动起点的相对高度。
-        self._takeoff_rel_z = torch.zeros(
+        # 每个环境、每只脚分别记录本次摆动起点的高度。
+        self._takeoff_z = torch.zeros(
             env.num_envs,
             2,
             device=env.device,
@@ -565,10 +670,10 @@ class SwingFootLiftReward(ManagerTermBase):
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         """环境重置时清除上一回合的起跳记录。"""
         if env_ids is None:
-            self._takeoff_rel_z.zero_()
+            self._takeoff_z.zero_()
             self._was_swing.zero_()
         else:
-            self._takeoff_rel_z[env_ids] = 0.0
+            self._takeoff_z[env_ids] = 0.0
             self._was_swing[env_ids] = False
 
     def __call__(
@@ -627,22 +732,20 @@ class SwingFootLiftReward(ManagerTermBase):
         is_swing = desired_contact_prob < 0.5
         swing_started = is_swing & (~self._was_swing)
 
-        # 脚相对机身的高度：可抵消整体机身上下运动。
-        foot_rel_z = (
-            asset.data.body_pos_w.torch[:, asset_cfg.body_ids, 2]
-            - asset.data.root_pos_w.torch[:, None, 2]
-        )
+        # 足端世界系高度，与评估器的 takeoff-to-current lift 定义保持一致。
+        foot_z = asset.data.body_pos_w.torch[:, asset_cfg.body_ids, 2]
 
-        # 进入摆动的第一帧记录抬起参考高度。
-        self._takeoff_rel_z = torch.where(
+        # 在进入摆动相位时记录足端起始高度。
+        self._takeoff_z = torch.where(
             swing_started,
-            foot_rel_z,
-            self._takeoff_rel_z,
+            foot_z,
+            self._takeoff_z,
         )
 
-        # 相对抬起点的向上位移；低于抬起点高度不产生负奖励。
+        # 足端相对于本次摆动起点的真实向上位移。
+        # 机身下蹲不会再被错误计算成抬脚。
         lift = torch.clamp(
-            foot_rel_z - self._takeoff_rel_z,
+            foot_z - self._takeoff_z,
             min=0.0,
         )
 
@@ -655,7 +758,10 @@ class SwingFootLiftReward(ManagerTermBase):
 
         # 在摆动段中心权重最大；接近落脚/离脚边界时自然减弱。
         swing_confidence = 1.0 - desired_contact_prob
-        reward = (lift_score * swing_confidence).mean(dim=1)
+        # 只奖励当前真正处于摆动区间的脚。
+        # 双足步态正常情况下每个时刻只有一只摆动脚，因此使用 sum，
+        # 避免 mean 将奖励无意义地缩小一半。
+        reward = (lift_score * swing_confidence * is_swing.float()).sum(dim=1)
 
         # 保存当前摆动状态，供下一控制步判断是否刚进入摆动。
         self._was_swing = is_swing

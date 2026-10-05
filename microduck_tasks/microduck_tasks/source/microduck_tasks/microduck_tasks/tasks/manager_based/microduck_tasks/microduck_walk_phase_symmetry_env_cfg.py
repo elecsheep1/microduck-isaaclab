@@ -219,6 +219,31 @@ class RewardsCfg:
         },
     )
 
+    # 机械功效率项
+    joint_mechanical_work = RewTerm(
+        func=mdp.JointMechanicalWorkPenalty,
+        weight=0.0,
+        params={
+            "actuator_name": "legs",
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    "left_hip_yaw",
+                    "left_hip_roll",
+                    "left_hip_pitch",
+                    "left_knee",
+                    "left_ankle",
+                    "right_hip_yaw",
+                    "right_hip_roll",
+                    "right_hip_pitch",
+                    "right_knee",
+                    "right_ankle",
+                ],
+                preserve_order=True,
+            ),
+        },
+    )
+
     # 鼓励行走时形成“单脚支撑、另一脚摆动”的节奏。
     air_time = RewTerm(
         func=mdp.biped_air_time,
@@ -278,7 +303,7 @@ class RewardsCfg:
     # swing和contact相位惩罚
     phase_swing_contact_penalty = RewTerm(
         func=mdp.phase_swing_contact_penalty,
-        weight=-0.0,
+        weight=-0.00,
         params={
             **GAIT_PHASE_PARAMS,
             **GAIT_CONTACT_SCHEDULE_PARAMS,
@@ -296,7 +321,7 @@ class RewardsCfg:
     # 抬脚奖励
     swing_foot_lift = RewTerm(
         func=mdp.SwingFootLiftReward,
-        weight=0.00,
+        weight=0.25,
         params={
             **GAIT_PHASE_PARAMS,
             **GAIT_CONTACT_SCHEDULE_PARAMS,
@@ -583,5 +608,4 @@ class MicroduckWalkPhaseSymmetryEnvCfg(ManagerBasedRLEnvCfg):
         # 方便观察小尺寸 Microduck 的初始视角。
         self.viewer.eye = (0.6, 0.6, 0.35)
         self.viewer.lookat = (0.0, 0.0, 0.1)
-
 

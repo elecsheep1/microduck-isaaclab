@@ -50,7 +50,7 @@ MICRODUCK_CFG = ArticulationCfg(
          # 对整套关节刚体系统（articulation）设置的 PhysX 求解器属性。
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             # 是否启用机器人自身不同 link 之间的碰撞。
-            enabled_self_collisions=False,
+            enabled_self_collisions=True,
             # 每个 physics step 中，位置约束的求解迭代次数。
             solver_position_iteration_count=8,
             # 每个 physics step 中，速度约束的求解迭代次数。
