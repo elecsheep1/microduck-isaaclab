@@ -98,8 +98,8 @@ class CommandsCfg:
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
             lin_vel_x=(0.04, 0.18),
             lin_vel_y=(0.0, 0.0),
-            # ang_vel_z=(-0.30, 0.30),
-            ang_vel_z=(-0.00, 0.00),
+            ang_vel_z=(-0.30, 0.30),
+            # ang_vel_z=(-0.00, 0.00),
         ),
     )
 
