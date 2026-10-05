@@ -204,6 +204,11 @@ class RewardsCfg:
         },
     )
 
+    base_vertical_velocity = RewTerm(
+        func=mdp.base_vertical_velocity_l2,
+        weight=-2.0,
+    )
+
     # 奖励跟踪yaw角
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp,
@@ -257,7 +262,7 @@ class RewardsCfg:
     # 控制步态相位
     phase_foot_contact = RewTerm(
         func=mdp.phase_foot_contact,
-        weight=1.0,
+        weight=0.25,
         params={
             **GAIT_PHASE_PARAMS,
             **GAIT_CONTACT_SCHEDULE_PARAMS,
@@ -291,7 +296,7 @@ class RewardsCfg:
     # 抬脚奖励
     swing_foot_lift = RewTerm(
         func=mdp.SwingFootLiftReward,
-        weight=0.20,
+        weight=0.00,
         params={
             **GAIT_PHASE_PARAMS,
             **GAIT_CONTACT_SCHEDULE_PARAMS,

@@ -11,6 +11,7 @@ lazy_export()
 
 from .rewards import (
     base_lin_vel_xy_l2,
+    base_vertical_velocity_l2,
     stand_vertical_velocity_exp,
     biped_air_time,
     feet_slide,

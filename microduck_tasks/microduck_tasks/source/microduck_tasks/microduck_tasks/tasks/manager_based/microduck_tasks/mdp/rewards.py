@@ -51,6 +51,16 @@ def base_lin_vel_xy_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scene
     # 计算平方和后得到每个环境的平面速度损失
     return torch.sum(torch.square(root_lin_vel_b[:, :2]), dim=1)
 
+def base_vertical_velocity_l2(
+        env: ManagerBasedRLEnv,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """惩罚机身竖直速度，抑制行走时双脚同步蹬地产生的跳跃。"""
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    vertical_velocity = asset.data.root_lin_vel_b.torch[:, 2]
+    return torch.square(vertical_velocity)
+
 def stand_vertical_velocity_exp(
         env: ManagerBasedRLEnv,
         command_name: str,
